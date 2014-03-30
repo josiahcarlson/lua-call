@@ -1,0 +1,101 @@
+
+Problem:
+    How do you add cross-script calling semantics to Lua scripting in Redis
+    given that Redis has been more or less locked down to prevent this exact
+    kind of thing?
+
+Solution:
+    1. Keep a function registry in Redis
+        a. The ':registry' key is a Redis HASH that maps from fully-dotted
+           names (explicitly defined, or inferred from (in this case) Python
+           package/module namespacing) to an 'f_' prefixed sha1 hash of the
+           registered Lua script
+
+    2. Use the _G global variable in Lua to access Lua scripts from within
+       Redis using the 'f_<sha1 hash>' name pulled from the ':registry' HASH:
+           _G[redis.call("HGET", ":registry", name)]
+
+    3. To pass arguments to called functions, use a 2-entry table appended to
+       the ARGV global, which represents the KEYS and ARGV for the called
+       script
+
+    4. Mangle all KEYS and ARGV references to instead reference _KEYS and
+       _ARGV
+
+    5. From within the called script, extract the arguments into _KEYS and
+       _ARGV locals, using the base KEYS and ARGV if the call came from
+       outside Redis (which is easily distinguished by the Lua condition:
+       "#ARGV == 0 or type(ARGV[#ARGV]) == 'string'")
+
+    6. Use CALL.<dotted name>(KEYS, ARGV) as a calling semantic to translate
+       calls into an alternate form that is actually used internally
+
+Example (defined as part of a script within example.py):
+    return CALL.return_args({}, {1, 2, 3, _ARGV})
+
+Is transformed into the following (line endings and comments inserted for ease
+of reading):
+
+    -- We reference either the externally-called KEYS/ARGV or the internally
+    -- called KEYS/ARGV in locals called _KEYS and _ARGV
+    local _KEYS, _ARGV;
+    if #ARGV == 0 or type(ARGV[#ARGV]) == 'string' then
+        -- Use the standard KEYS and ARGV as passed from the external caller
+        _KEYS = KEYS;
+        _ARGV = ARGV;
+    else
+        -- Pull the KEYS and ARGV from the table appended to ARGV
+        _KEYS = ARGV[#ARGV][1];
+        _ARGV = ARGV[#ARGV][2];
+
+        -- We remove the pushed reference to prevent circular references,
+        -- which can crash Redis if you aren't careful
+        table.remove(ARGV);
+    end;
+
+    -- push the arguments onto the ARGV table as call stack arguments
+    table.insert(ARGV, {{}, {1, 2, 3, _ARGV}});
+
+    -- fetch the script hash from the name and call the function
+    return _G[redis.call('HGET', ':registry', 'example.return_args')]();
+
+Note that both the called script and the caller script must include the _KEYS
+and _ARGV local definition, as well as the if/else blocks.
+
+Only calling scripts require the table.insert() and _G[]-related pieces
+to handle calls. All of this is taken care of by our wrapper and
+transformation method.
+
+
+Notes/future directions:
+Technically speaking, the function registry inside Redis is not necessary if
+your scripts have a directed acyclic calling graph (a DACG, which I'll mention
+later). Which is to say, if you have a script function X, and it calls Y and
+Z, then you can consider X as being a node in a graph with directed edges to Y
+and Z.
+
+If you generate a directed graph using what functions each script calls, and
+the resulting graph can be topologically sorted, then you can replace the
+_G[...] references and calling pieces with direct references to the
+f_<sha1 hash> names, which can be executed directly without a pass through a
+Redis call.
+
+On the other hand, if you have scripts A, B, C, where A calls B, B calls C,
+and C calls A, you have a cycle. Because of this cycle, if you were try to fix
+the name for the call to B from A, that would change the hash of A, which
+would invalidate any previously-fixed calls in C, which would also invalidate
+any previously fixed calls in B, which would invalidate our attempt to fix the
+reference in A.
+
+
+Why would anyone even bother with name fixing? Speed. It takes roughly 174 ms
+for 1 million calls using the name fixing vs. 785ms for 1 million calls using
+_G[...]. Another interesting opportunity is that if you have a DACG and were
+to fix all function call references, and you never called SCRIPT FLUSH, you
+could call any version of your scripts at any time in the future.
+
+For the sake of simplicity in implementation for myself and others, I've
+decided to just use the Redis call registry mechanism with the _G[...] part.
+While it is not necessarily the fastest method to handle the calls, hopefully
+anyone can read the source code of the module and make this work in whatever
+host language they are using.
